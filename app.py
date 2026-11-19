@@ -16,9 +16,11 @@
 #
 # Deploy on Railway: connect this repo, add a Volume mounted at /data
 # (so users survive redeploys), set PORT automatically by Railway.
-# Optional env: ADMIN_PASSWORD — if set, the panel asks for it on login.
+# Login: password-only page, default password "admin" (change in Settings).
+# Optional env: ADMIN_PASSWORD — if set, it overrides the stored password.
 #              DATA_DIR — default /data when it exists, else local folder.
 
+import hashlib
 import math
 import os
 import secrets
@@ -38,7 +40,18 @@ app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "nexuz.db")
+# Optional env: ADMIN_PASSWORD — if set, it overrides the stored password.
+# Otherwise the panel password lives in the DB (settings: admin_password_hash),
+# default "admin", changeable from the Settings page.
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+
+def _sha(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def check_admin_password(pw):
+    if ADMIN_PASSWORD:
+        return pw == ADMIN_PASSWORD
+    return _sha(pw or "") == get_setting("admin_password_hash")
 
 DEFAULT_SETTINGS = {
     "panel_name": "NEXUZ",
@@ -49,6 +62,7 @@ DEFAULT_SETTINGS = {
     "network": "ws",
     "security": "tls",
     "sub_base_url": "",
+    "admin_password_hash": _sha("admin"),
 }
 
 # ---------------------------------------------------------------- DB
@@ -158,8 +172,6 @@ def sub_url_for(user, settings):
     return f"{base}/sub/{user['token']}"
 
 def require_login():
-    if not ADMIN_PASSWORD:
-        return None
     if session.get("admin") is True:
         return None
     return redirect(url_for("login", next=request.path))
@@ -258,14 +270,35 @@ def health():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if request.method == "POST" and request.form.get("password") == ADMIN_PASSWORD:
-        session["admin"] = True
-        return redirect(request.args.get("next") or "/")
-    return page("ورود", "home", """
-        <div class="card"><h2>🔐 ورود به پنل</h2>
-        <form method="post"><label>رمز مدیریت</label>
-        <input type="password" name="password" required>
-        <div style="height:12px"></div><button class="btn">ورود</button></form></div>""")
+    error = ""
+    if request.method == "POST":
+        if check_admin_password(request.form.get("password") or ""):
+            session["admin"] = True
+            return redirect(request.args.get("next") or "/")
+        error = "رمز اشتباه است، دوباره امتحان کن."
+    return render_template_string(f"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ورود | NEXUZ 🦁☀️</title>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700;900&display=swap" rel="stylesheet">
+<style>{CSS}
+.loginbox{{max-width:420px;margin:9vh auto 0;text-align:center}}
+.loginbox .emblem{{width:110px;height:110px;flex-basis:110px;font-size:58px;margin:0 auto 10px}}
+.loginbox .emblem span{{font-size:32px;top:-12px;left:-6px}}
+.loginbox h1{{font-size:44px}}
+.loginbox .card{{padding:28px 24px}}
+.loginbox input{{text-align:center;font-size:20px;letter-spacing:2px;padding:14px}}
+.loginbox .btn{{width:100%;padding:14px;font-size:18px;margin-top:16px}}
+</style></head><body><div class="wrap"><div class="loginbox">
+<div class="emblem">🦁<span>☀️</span></div>
+<h1>NEXUZ</h1><div class="sub">شیر و خورشید 🦁☀️ &nbsp;|&nbsp; پنل V2Ray</div>
+<div class="flag"><div class="g"></div><div class="w"></div><div class="r"></div></div>
+<div class="card"><h2>🔐 ورود به پنل</h2>
+{f'<div class="err">{error}</div>' if error else ''}
+<form method="post"><label style="text-align:right">رمز ورود</label>
+<input type="password" name="password" required autofocus placeholder="••••••••" autocomplete="current-password">
+<button class="btn">🦁 ورود</button></form>
+<p class="small" style="margin-top:14px">رمز اولیه: <b>admin</b> — بعد از ورود از تنظیمات عوضش کن.</p>
+</div></div></div></body></html>""")
 
 @app.route("/logout")
 def logout():
@@ -374,19 +407,33 @@ def settings_page():
     if chk: return chk
     msg = ""
     if request.method == "POST":
-        set_setting("panel_name", (request.form.get("panel_name") or "NEXUZ").strip() or "NEXUZ")
-        set_setting("server_address", (request.form.get("server_address") or "").strip())
-        try:
-            port = int(request.form.get("port") or 443)
-            set_setting("port", str(max(1, min(port, 65535))))
-        except ValueError:
-            pass
-        set_setting("sni", (request.form.get("sni") or "").strip())
-        set_setting("ws_path", (request.form.get("ws_path") or "nexuz").strip().lstrip("/") or "nexuz")
-        set_setting("network", request.form.get("network") or "ws")
-        set_setting("security", request.form.get("security") or "tls")
-        set_setting("sub_base_url", (request.form.get("sub_base_url") or "").strip())
-        msg = "<div class='okmsg'>✅ تنظیمات ذخیره شد.</div>"
+        new_pw = (request.form.get("new_password") or "").strip()
+        new_pw2 = (request.form.get("new_password2") or "").strip()
+        if new_pw or new_pw2:
+            if len(new_pw) < 4:
+                msg = "<div class='err'>رمز جدید باید حداقل ۴ کاراکتر باشد.</div>"
+            elif new_pw != new_pw2:
+                msg = "<div class='err'>تکرار رمز با رمز جدید یکی نیست.</div>"
+            elif ADMIN_PASSWORD:
+                msg = "<div class='err'>رمز از متغیر محیطی ADMIN_PASSWORD آمده و از اینجا عوض نمی‌شود.</div>"
+            else:
+                set_setting("admin_password_hash", _sha(new_pw))
+                msg = "<div class='okmsg'>✅ رمز ورود عوض شد.</div>"
+        if "panel_name" in request.form:
+            set_setting("panel_name", (request.form.get("panel_name") or "NEXUZ").strip() or "NEXUZ")
+            set_setting("server_address", (request.form.get("server_address") or "").strip())
+            try:
+                port = int(request.form.get("port") or 443)
+                set_setting("port", str(max(1, min(port, 65535))))
+            except ValueError:
+                pass
+            set_setting("sni", (request.form.get("sni") or "").strip())
+            set_setting("ws_path", (request.form.get("ws_path") or "nexuz").strip().lstrip("/") or "nexuz")
+            set_setting("network", request.form.get("network") or "ws")
+            set_setting("security", request.form.get("security") or "tls")
+            set_setting("sub_base_url", (request.form.get("sub_base_url") or "").strip())
+        if not msg:
+            msg = "<div class='okmsg'>✅ تنظیمات ذخیره شد.</div>"
     s = get_all_settings()
     base = (s.get("sub_base_url") or request.host_url.rstrip("/"))
     content = f"""
@@ -408,7 +455,15 @@ def settings_page():
       <input name="sub_base_url" value="{s['sub_base_url']}" dir="ltr" style="text-align:left" placeholder="https://your-panel.up.railway.app">
       <div style="height:14px"></div><button class="btn">💾 ذخیره تنظیمات</button>
     </form>
-    <p class="small">نمونه ساب‌لینک: <span style="direction:ltr;display:inline-block">{base}/sub/&lt;token&gt;</span><br>
+    </div>
+    <div class="card"><h2>🔐 تغییر رمز ورود پنل</h2>
+    <p class="small">رمز فعلی فقط با رمز جدید عوض می‌شود؛ اگر هر دو فیلد خالی بماند، رمز عوض نمی‌شود.</p>
+    <form method="post">
+      <label>رمز جدید</label><input type="password" name="new_password" autocomplete="new-password">
+      <label>تکرار رمز جدید</label><input type="password" name="new_password2" autocomplete="new-password">
+      <div style="height:14px"></div><button class="btn">🔐 تغییر رمز</button>
+    </form></div>
+    <div class="card"><p class="small">نمونه ساب‌لینک: <span style="direction:ltr;display:inline-block">{base}/sub/&lt;token&gt;</span><br>
     💡 آدرس سرور را حتماً وارد کن؛ بدون آن کانفیگ‌ها با your-server.com ساخته می‌شوند.</p></div>"""
     return page("تنظیمات", "settings", content)
 
