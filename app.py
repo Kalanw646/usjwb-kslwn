@@ -16,6 +16,10 @@
 #
 # Deploy on Railway: connect this repo, add a Volume mounted at /data
 # (so users survive redeploys), set PORT automatically by Railway.
+# Architecture: Dockerfile installs Xray core + nginx. nginx on $PORT
+# proxies WS /nexuz to Xray (127.0.0.1:10086) and the rest to Flask
+# (127.0.0.1:5000). The panel rewrites /data/xray-config.json from the DB
+# on every user create/delete and restarts Xray, so configs really work.
 # Login: password-only page, default password "admin" (change in Settings).
 # Optional env: ADMIN_PASSWORD — if set, it overrides the stored password.
 #              DATA_DIR — default /data when it exists, else local folder.
@@ -33,9 +37,19 @@ from flask import (
     Flask, g, redirect, render_template_string, request,
     Response, session, url_for,
 )
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+
+# Xray core runs in the same Railway container (see Dockerfile/start.sh):
+# nginx on $PORT proxies WS /nexuz to Xray (127.0.0.1:10086) and everything
+# else to this Flask panel (127.0.0.1:5000). Railway terminates TLS, so
+# Xray uses security=none internally and clients use tls on port 443.
+XRAY_PORT = 10086
+XRAY_CONFIG_PATH = os.path.join("/data", "xray-config.json") if os.path.isdir("/data") else os.path.join(".", "xray-config.json")
+WS_PATH = "nexuz"  # fixed path: nginx proxies /nexuz to Xray
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -134,41 +148,103 @@ def is_active(user):
 def fmt_date(s):
     return parse_dt(s).strftime("%Y-%m-%d")
 
-def build_vless(user, settings, server=None):
-    """Real VLESS URI for a user."""
-    server = (server or settings.get("server_address") or "your-server.com").strip()
+def default_server():
+    # Xray runs on the same domain as the panel (nginx proxies /nexuz to it),
+    # so when no server address is set in Settings, the panel's own host is
+    # the VLESS server — configs are never empty / never your-server.com.
+    try:
+        return request.host.split(":")[0]
+    except Exception:
+        return "your-server.com"
+
+def build_vless(user, settings, server=None, remark=None):
+    """Real VLESS URI for a user. Server defaults to this panel's domain."""
+    server = (server or settings.get("server_address") or default_server()).strip()
     port = settings.get("port") or "443"
     sni = (settings.get("sni") or server).strip()
-    path = (settings.get("ws_path") or "nexuz").strip().lstrip("/")
-    network = settings.get("network") or "ws"
-    security = settings.get("security") or "tls"
-    params = f"encryption=none&security={security}&sni={quote(sni)}&fp=chrome&type={network}"
-    if network == "ws":
-        params += f"&path=%2F{quote(path)}&host={quote(server)}"
+    # Railway terminates TLS on 443; Xray behind nginx uses ws, no TLS.
+    params = (f"encryption=none&security=tls&sni={quote(sni)}&fp=chrome"
+              f"&type=ws&path=%2F{WS_PATH}&host={quote(server)}")
     return (f"vless://{user['uuid']}@{server}:{port}?{params}"
-            f"#{quote(user['username'])}")
-
-def dummy_vless(remark):
-    """Info entry: shows in the client list, connects to nothing."""
-    return ("vless://00000000-0000-0000-0000-000000000000"
-            f"@127.0.0.1:1?encryption=none&security=none&type=tcp#{quote(remark)}")
+            f"#{quote(remark if remark is not None else user['username'])}")
 
 def build_sub_lines(user, settings):
+    # Info entries use the SAME real server + UUID as the main config, only
+    # the remark differs. Earlier dummy entries (127.0.0.1:1) made some
+    # clients (v2rayNG) reject the whole subscription — valid entries import
+    # everywhere (v2rayNG, Streisand, FoXray, Happ).
     vol = float(user["volume_gb"])
     left = max(0.0, vol - float(user["used_gb"]))
     days = remaining_days(user)
     lines = [
-        dummy_vless(f"👤 نام کاربری: {user['username']}"),
-        dummy_vless(f"📦 حجم: {vol:g} گیگابایت | باقی‌مانده: {left:g} گیگابایت"),
-        dummy_vless(f"⏳ زمان باقی‌مانده: {days} روز"),
+        build_vless(user, settings, remark=f"👤 نام کاربری: {user['username']}"),
+        build_vless(user, settings, remark=f"📦 حجم: {vol:g} گیگابایت | باقی‌مانده: {left:g} گیگابایت"),
+        build_vless(user, settings, remark=f"⏳ زمان باقی‌مانده: {days} روز"),
         build_vless(user, settings),
     ]
     return lines
+
+def sync_xray_config():
+    """Rewrite Xray's config from the panel DB (all active users as clients).
+    Safe to call outside a request: opens its own SQLite connection."""
+    import json
+    try:
+        db = sqlite3.connect(DB_PATH)
+        db.row_factory = sqlite3.Row
+        users = db.execute("SELECT * FROM users").fetchall()
+        db.close()
+    except Exception:
+        users = []
+    clients = []
+    for u in users:
+        try:
+            if not is_active(u):
+                continue
+        except Exception:
+            pass
+        clients.append({"id": u["uuid"], "email": u["username"], "level": 0})
+    cfg = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "port": XRAY_PORT,
+            "protocol": "vless",
+            "settings": {"clients": clients, "decryption": "none"},
+            "streamSettings": {
+                "network": "ws",
+                "wsSettings": {"path": f"/{WS_PATH}"},
+            },
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
+        }],
+        "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+    }
+    try:
+        os.makedirs(os.path.dirname(XRAY_CONFIG_PATH) or ".", exist_ok=True)
+        with open(XRAY_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return len(clients)
+
+def restart_xray():
+    """Ask the start.sh loop to restart Xray with the new config."""
+    import subprocess
+    try:
+        subprocess.run(["pkill", "-f", "xray run"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+def sync_and_restart_xray():
+    sync_xray_config()
+    restart_xray()
 
 def sub_url_for(user, settings):
     base = (settings.get("sub_base_url") or "").strip().rstrip("/")
     if not base:
         base = request.host_url.rstrip("/")
+    # Railway serves the panel over https (TLS terminated at the edge), but
+    # Flask behind the proxy sees http — force https so clients accept the sub.
+    if base.startswith("http://") and ("railway.app" in base or request.headers.get("X-Forwarded-Proto") == "https"):
+        base = "https://" + base[len("http://"):]
     return f"{base}/sub/{user['token']}"
 
 def require_login():
@@ -315,6 +391,14 @@ def home():
     total = len(users)
     active_n = sum(1 for u in users if is_active(u))
     total_vol = sum(float(u["volume_gb"]) for u in users)
+    used_vol = sum(float(u["used_gb"]) for u in users)
+    import subprocess as _sp
+    try:
+        _r = _sp.run(["pgrep", "-f", "xray run"], capture_output=True, timeout=3)
+        xray_on = _r.returncode == 0
+    except Exception:
+        xray_on = False
+    xray_badge = "🟢 هسته V2Ray فعال است" if xray_on else "🔴 هسته V2Ray خاموش است"
     rows = ""
     for u in users:
         days = remaining_days(u)
@@ -322,7 +406,7 @@ def home():
         vless = build_vless(u, settings)
         sub = sub_url_for(u, settings)
         rows += f"""<tr><td><b>{u['username']}</b><br><span class="small">{st}</span></td>
-        <td>{float(u['volume_gb']):g} GB</td><td>{days} روز<br><span class="small">تا {fmt_date(u['expires_at'])}</span></td>
+        <td>{float(u['volume_gb']):g} GB</td><td>{float(u['used_gb']):g} GB</td><td>{days} روز<br><span class="small">تا {fmt_date(u['expires_at'])}</span></td>
         <td><div class="row">{copy_btn(vless, '📋 کانفیگ')}{copy_btn(sub, '🔗 ساب')}</div>
         <div style="height:6px"></div>
         <form method="post" action="/user/{u['id']}/delete" onsubmit="return confirm('کاربر {u['username']} حذف شود؟')">
@@ -332,11 +416,13 @@ def home():
       <div class="stat"><b>{total}</b>کل کاربران 👥</div>
       <div class="stat"><b>{active_n}</b>کاربر فعال ✅</div>
       <div class="stat"><b>{total_vol:g} GB</b>حجم کل 📦</div>
+      <div class="stat"><b>{used_vol:g} GB</b>حجم مصرفی 📊</div>
     </div>
+    <p class="small" style="text-align:center">{xray_badge} &nbsp;|&nbsp; سرور کانفیگ: دامنه همین پنل (هسته V2Ray روی همین سرور نصب است)</p>
     <div class="card"><h2>👥 کاربران</h2>
     <input id="q" placeholder="🔍 جستجوی کاربر..." oninput="document.querySelectorAll('tbody tr').forEach(r=>r.style.display=r.textContent.includes(this.value)?'':'none')">
-    <div style="overflow-x:auto"><table><thead><tr><th>کاربر</th><th>حجم</th><th>زمان باقی‌مانده</th><th>اقدام</th></tr></thead>
-    <tbody>{rows or '<tr><td colspan="4">هنوز کاربری ساخته نشده — از صفحه «ایجاد کاربر» شروع کن ➕</td></tr>'}</tbody></table></div>
+    <div style="overflow-x:auto"><table><thead><tr><th>کاربر</th><th>حجم</th><th>مصرف‌شده</th><th>زمان باقی‌مانده</th><th>اقدام</th></tr></thead>
+    <tbody>{rows or '<tr><td colspan="5">هنوز کاربری ساخته نشده — از صفحه «ایجاد کاربر» شروع کن ➕</td></tr>'}</tbody></table></div>
     <p class="small">💡 برای اینکه کانفیگ ساخته شود، اول در «تنظیمات» آدرس سرور را وارد کن.</p></div>
     <script>/* search uses inline handler above */</script>"""
     return page("صفحه اصلی", "home", content)
@@ -371,6 +457,7 @@ def create():
                     (username, uid, token, volume, 0, days,
                      created.isoformat(), expires.isoformat()))
                 db.commit()
+                sync_and_restart_xray()
                 u = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
                 vless = build_vless(u, settings)
                 sub = sub_url_for(u, settings)
@@ -440,11 +527,11 @@ def settings_page():
     <div class="card"><h2>⚙️ تنظیمات</h2>{msg}
     <form method="post">
       <label>نام پنل</label><input name="panel_name" value="{s['panel_name']}">
-      <label>🌐 آدرس سرور V2Ray (دامنه یا IP — همان که در کانفیگ VLESS می‌آید)</label>
-      <input name="server_address" value="{s['server_address']}" placeholder="مثلاً vpn.example.com" dir="ltr" style="text-align:left">
+      <label>🌐 آدرس سرور V2Ray (خالی = دامنه همین پنل؛ هسته V2Ray روی همین سرور نصب است و کانفیگ با دامنه پنل ساخته می‌شود)</label>
+      <input name="server_address" value="{s['server_address']}" placeholder="خالی بگذار — دامنه پنل استفاده می‌شود" dir="ltr" style="text-align:left">
       <label>🔌 پورت</label><input name="port" type="number" value="{s['port']}">
       <label>🔒 SNI (خالی = مثل آدرس سرور)</label><input name="sni" value="{s['sni']}" dir="ltr" style="text-align:left" placeholder="مثلاً vpn.example.com">
-      <label>🛤️ مسیر WebSocket</label><input name="ws_path" value="{s['ws_path']}" dir="ltr" style="text-align:left">
+      <p class="small">🛤️ مسیر WebSocket ثابت است: <b>/nexuz</b> (هسته V2Ray روی همین مسیر گوش می‌دهد).</p>
       <label>📡 شبکه (Network)</label>
       <select name="network"><option value="ws" {'selected' if s['network']=='ws' else ''}>ws (WebSocket)</option>
       <option value="tcp" {'selected' if s['network']=='tcp' else ''}>tcp</option></select>
@@ -474,6 +561,7 @@ def delete_user(user_id):
     db = get_db()
     db.execute("DELETE FROM users WHERE id=?", (user_id,))
     db.commit()
+    sync_and_restart_xray()
     return redirect("/")
 
 @app.route("/sub/<token>")
@@ -534,6 +622,14 @@ box-shadow:0 6px 30px rgba(0,0,0,.5);border:2px solid #fbbf24}}
 
 if __name__ == "__main__":
     init_db()
+    try:
+        sync_xray_config()
+    except Exception:
+        pass
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
 else:
     init_db()
+    try:
+        sync_xray_config()
+    except Exception:
+        pass
