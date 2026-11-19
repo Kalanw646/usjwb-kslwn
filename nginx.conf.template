@@ -12,6 +12,19 @@ http {
   server {
     listen __PORT__;
     client_max_body_size 10m;
+    # VLESS over XHTTP -> Xray core (same idea as WS, different shape)
+    location /xhttp {
+      proxy_pass http://127.0.0.1:10087;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_buffering off;
+      proxy_request_buffering off;
+      tcp_nodelay on;
+      proxy_socket_keepalive on;
+      proxy_read_timeout 86400s;
+      proxy_send_timeout 86400s;
+    }
+
     # VLESS over WebSocket -> Xray core
     location /nexuz {
       proxy_pass http://127.0.0.1:10086;

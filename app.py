@@ -44,12 +44,17 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 # Xray core runs in the same Railway container (see Dockerfile/start.sh):
-# nginx on $PORT proxies WS /nexuz to Xray (127.0.0.1:10086) and everything
-# else to this Flask panel (127.0.0.1:5000). Railway terminates TLS, so
-# Xray uses security=none internally and clients use tls on port 443.
-XRAY_PORT = 10086
+# nginx on $PORT proxies WS /nexuz to Xray (127.0.0.1:10086), XHTTP /xhttp
+# to Xray (127.0.0.1:10087), and everything else to this Flask panel
+# (127.0.0.1:5000). Railway terminates TLS, so Xray uses security=none
+# internally for those and clients use tls on port 443. Reality runs on
+# raw TCP 8443, exposed via Railway TCP Proxy (no TLS termination there).
+XRAY_PORT = 10086  # VLESS+WS inbound (behind nginx, plain HTTP after the edge)
+XHTTP_PORT = 10087  # VLESS+XHTTP inbound (behind nginx, plain HTTP after the edge)
+REALITY_PORT = 8443  # VLESS+Reality inbound (raw TCP, via Railway TCP Proxy)
 XRAY_CONFIG_PATH = os.path.join("/data", "xray-config.json") if os.path.isdir("/data") else os.path.join(".", "xray-config.json")
 WS_PATH = "nexuz"  # fixed path: nginx proxies /nexuz to Xray
+XHTTP_PATH = "xhttp"  # fixed path: nginx proxies /xhttp to Xray
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -77,6 +82,15 @@ DEFAULT_SETTINGS = {
     "security": "tls",
     "sub_base_url": "",
     "sub_volume_unit": "GB",
+    # Reality (VLESS over raw TCP via Railway TCP Proxy): cover domain whose
+    # TLS the handshake mimics, the proxy endpoint Railway assigns, and the
+    # panel's own x25519 keypair + shortId (generated once, stored in DB).
+    "reality_dest": "snapp.ir",
+    "reality_host": "",
+    "reality_port": "",
+    "reality_private_key": "",
+    "reality_public_key": "",
+    "reality_short_id": "",
     "admin_password_hash": _sha("admin"),
 }
 
@@ -175,14 +189,35 @@ def default_server():
     except Exception:
         return "your-server.com"
 
-def build_vless(user, settings, server=None, remark=None):
-    """Real VLESS URI for a user. Server defaults to this panel's domain."""
+def build_vless(user, settings, server=None, remark=None, kind="ws"):
+    """Real VLESS URI for a user.
+    kind="ws": VLESS+WS+TLS on 443 to the panel domain (fallback).
+    kind="xhttp": VLESS+XHTTP+TLS on 443 to the panel domain.
+    kind="reality": VLESS+Reality over raw TCP to the Railway TCP Proxy
+    endpoint (the strong one for Iran); None when not configured yet."""
+    if kind == "reality":
+        host = (settings.get("reality_host") or "").strip()
+        port = (settings.get("reality_port") or "").strip()
+        pub = (settings.get("reality_public_key") or "").strip()
+        sid = (settings.get("reality_short_id") or "").strip()
+        dest = (settings.get("reality_dest") or "snapp.ir").strip()
+        if not (host and port and pub and sid):
+            return None
+        params = (f"encryption=none&flow=xtls-rprx-vision&security=reality"
+                  f"&sni={quote(dest)}&fp=chrome&pbk={quote(pub)}&sid={quote(sid)}&type=tcp")
+        return (f"vless://{user['uuid']}@{host}:{port}?{params}"
+                f"#{quote(remark if remark is not None else user['username'])}")
     server = (server or settings.get("server_address") or default_server()).strip()
     port = settings.get("port") or "443"
     sni = (settings.get("sni") or server).strip()
-    # Railway terminates TLS on 443; Xray behind nginx uses ws, no TLS.
-    params = (f"encryption=none&security=tls&sni={quote(sni)}&fp=chrome"
-              f"&type=ws&path=%2F{WS_PATH}&host={quote(server)}")
+    if kind == "xhttp":
+        # Railway terminates TLS on 443; Xray behind nginx uses xhttp, no TLS.
+        params = (f"encryption=none&security=tls&sni={quote(sni)}&fp=chrome"
+                  f"&type=xhttp&mode=packet-up&path=%2F{XHTTP_PATH}&host={quote(server)}")
+    else:
+        # Railway terminates TLS on 443; Xray behind nginx uses ws, no TLS.
+        params = (f"encryption=none&security=tls&sni={quote(sni)}&fp=chrome"
+                  f"&type=ws&path=%2F{WS_PATH}&host={quote(server)}")
     return (f"vless://{user['uuid']}@{server}:{port}?{params}"
             f"#{quote(remark if remark is not None else user['username'])}")
 
@@ -200,12 +235,79 @@ def build_sub_lines(user, settings):
         build_vless(user, settings, remark=f"⏳ زمان باقی‌مانده: {days} روز"),
         build_vless(user, settings),
     ]
+    # Reality first-class: the strong transport for Iran (DPI can't tell it
+    # from a real TLS handshake to the cover domain). XHTTP second.
+    reality = build_vless(user, settings, kind="reality",
+                          remark=f"🔒 Reality — {user['username']}")
+    if reality:
+        lines.append(reality)
+    xhttp = build_vless(user, settings, kind="xhttp",
+                        remark=f"⚡ XHTTP — {user['username']}")
+    if xhttp:
+        lines.append(xhttp)
     return lines
+
+def _read_settings_direct():
+    """Read settings straight from SQLite (works outside a request)."""
+    out = dict(DEFAULT_SETTINGS)
+    try:
+        db = sqlite3.connect(DB_PATH)
+        db.row_factory = sqlite3.Row
+        for r in db.execute("SELECT key, value FROM settings").fetchall():
+            out[r["key"]] = r["value"]
+        db.close()
+    except Exception:
+        pass
+    return out
+
+def ensure_reality_keys():
+    """Generate the panel's Reality x25519 keypair once (via the xray CLI)
+    and a shortId; stored in the settings DB, never in git."""
+    import secrets, shutil, subprocess
+    try:
+        s = _read_settings_direct()
+        if s.get("reality_private_key") and s.get("reality_short_id"):
+            return
+        db = sqlite3.connect(DB_PATH)
+        if not s.get("reality_private_key"):
+            exe = shutil.which("xray") or "/usr/local/bin/xray"
+            try:
+                r = subprocess.run([exe, "x25519"], capture_output=True,
+                                   text=True, timeout=15)
+                priv = pub = ""
+                for line in (r.stdout or "").splitlines():
+                    # Xray 26 prints "PrivateKey: ..." / "Password (PublicKey): ...";
+                    # older versions print "Private key: ..." / "Public key: ...".
+                    low = line.lower().replace(" ", "")
+                    if low.startswith("privatekey:"):
+                        priv = line.split(":", 1)[1].strip()
+                    if low.startswith("password(publickey):") or low.startswith("publickey:"):
+                        pub = line.split(":", 1)[1].strip()
+                if priv:
+                    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('reality_private_key', ?)", (priv,))
+                    if pub:
+                        db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('reality_public_key', ?)", (pub,))
+            except Exception:
+                pass
+        if not s.get("reality_short_id"):
+            db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('reality_short_id', ?)",
+                       (secrets.token_hex(8),))
+        db.commit()
+        db.close()
+    except Exception:
+        pass
 
 def sync_xray_config():
     """Rewrite Xray's config from the panel DB (all active users as clients).
-    Safe to call outside a request: opens its own SQLite connection."""
+    Safe to call outside a request: opens its own SQLite connection.
+    Three inbounds share the same users:
+    - WS on 10086 (behind nginx, TLS terminated at Railway's edge) — fallback
+    - XHTTP on 10087 (behind nginx, same edge) — second option on port 443
+    - Reality on 8443 (raw TCP, exposed via Railway TCP Proxy) — the strong
+      one for Iran: the handshake looks exactly like TLS to the cover domain,
+      so DPI can't starve it the way it starves the WS tunnel."""
     import json
+    ensure_reality_keys()
     try:
         db = sqlite3.connect(DB_PATH)
         db.row_factory = sqlite3.Row
@@ -213,32 +315,66 @@ def sync_xray_config():
         db.close()
     except Exception:
         users = []
-    clients = []
+    rs = _read_settings_direct()
+    ws_clients = []
+    reality_clients = []
     for u in users:
         try:
             if not is_active(u):
                 continue
         except Exception:
             pass
-        clients.append({"id": u["uuid"], "email": u["username"], "level": 0})
+        ws_clients.append({"id": u["uuid"], "email": u["username"], "level": 0})
+        reality_clients.append({"id": u["uuid"], "email": u["username"],
+                                "level": 0, "flow": "xtls-rprx-vision"})
+    inbounds = [{
+        "port": XRAY_PORT,
+        "protocol": "vless",
+        "settings": {"clients": ws_clients, "decryption": "none"},
+        "streamSettings": {
+            "network": "ws",
+            "wsSettings": {"path": f"/{WS_PATH}"},
+        },
+        # Sniffing OFF: it misroutes non-TLS traffic (Telegram MTProto)
+        # and stalls connections; the original destination is correct.
+        "sniffing": {"enabled": False},
+    }, {
+        "port": XHTTP_PORT,
+        "protocol": "vless",
+        "settings": {"clients": ws_clients, "decryption": "none"},
+        "streamSettings": {
+            "network": "xhttp",
+            "xhttpSettings": {"path": f"/{XHTTP_PATH}", "mode": "packet-up"},
+        },
+        "sniffing": {"enabled": False},
+    }]
+    priv = (rs.get("reality_private_key") or "").strip()
+    sid = (rs.get("reality_short_id") or "").strip()
+    dest = (rs.get("reality_dest") or "snapp.ir").strip()
+    if priv:
+        inbounds.append({
+            "port": REALITY_PORT,
+            "protocol": "vless",
+            "settings": {"clients": reality_clients, "decryption": "none"},
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "dest": f"{dest}:443",
+                    "serverNames": [dest],
+                    "privateKey": priv,
+                    "shortIds": [sid] if sid else [],
+                },
+            },
+            "sniffing": {"enabled": False},
+        })
     cfg = {
         "log": {"loglevel": "warning"},
         # Force IPv4 DNS: some networks answer AAAA records first but have no
         # IPv6 egress, so connections hang forever (ping works, data never
         # flows — YouTube/Telegram never load). UseIPv4 fixes that.
         "dns": {"servers": ["8.8.8.8", "1.1.1.1"], "queryStrategy": "UseIPv4"},
-        "inbounds": [{
-            "port": XRAY_PORT,
-            "protocol": "vless",
-            "settings": {"clients": clients, "decryption": "none"},
-            "streamSettings": {
-                "network": "ws",
-                "wsSettings": {"path": f"/{WS_PATH}"},
-            },
-            # Sniffing OFF: it misroutes non-TLS traffic (Telegram MTProto)
-            # and stalls connections; the original destination is correct.
-            "sniffing": {"enabled": False},
-        }],
+        "inbounds": inbounds,
         "outbounds": [{"protocol": "freedom", "tag": "direct",
                        "domainStrategy": "UseIPv4"}],
     }
@@ -248,7 +384,7 @@ def sync_xray_config():
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-    return len(clients)
+    return len(ws_clients)
 
 def restart_xray():
     """Ask the start.sh loop to restart Xray with the new config."""
@@ -438,11 +574,18 @@ def home():
         else:
             st = "<span class='badge off'>منقضی ⛔</span>"
         vless = build_vless(u, settings)
+        reality = build_vless(u, settings, kind="reality")
+        xhttp = build_vless(u, settings, kind="xhttp")
         sub = sub_url_for(u, settings)
+        extra_btns = ""
+        if reality:
+            extra_btns += copy_btn(reality, '🔒 Reality')
+        if xhttp:
+            extra_btns += copy_btn(xhttp, '⚡ XHTTP')
         stop_label = "▶️ شروع" if stopped else "⏸️ توقف"
         rows += f"""<tr><td><b>{u['username']}</b><br><span class="small">{st}</span></td>
         <td>{float(u['volume_gb']):g} GB</td><td>{float(u['used_gb']):g} GB</td><td>{days} روز<br><span class="small">تا {fmt_date(u['expires_at'])}</span></td>
-        <td><div class="row">{copy_btn(vless, '📋 کانفیگ')}{copy_btn(sub, '🔗 ساب')}</div>
+        <td><div class="row">{copy_btn(vless, '📋 کانفیگ')}{copy_btn(sub, '🔗 ساب')}{extra_btns}</div>
         <div style="height:6px"></div>
         <div class="row">
         <form method="post" action="/user/{u['id']}/toggle-stop">
@@ -461,7 +604,7 @@ def home():
     <input id="q" placeholder="🔍 جستجوی کاربر..." oninput="document.querySelectorAll('tbody tr').forEach(r=>r.style.display=r.textContent.includes(this.value)?'':'none')">
     <div style="overflow-x:auto"><table><thead><tr><th>کاربر</th><th>حجم</th><th>مصرف‌شده</th><th>زمان باقی‌مانده</th><th>اقدام</th></tr></thead>
     <tbody>{rows or '<tr><td colspan="5">هنوز کاربری ساخته نشده — از صفحه «ایجاد کاربر» شروع کن ➕</td></tr>'}</tbody></table></div>
-    <p class="small">💡 برای اینکه کانفیگ ساخته شود، اول در «تنظیمات» آدرس سرور را وارد کن.</p></div>
+    <p class="small">💡 کانفیگ‌ها با دامنه همین پنل ساخته می‌شوند؛ اگر Reality را می‌خواهی، در «تنظیمات» آدرس TCP Proxy ریل‌وی را وارد کن.</p></div>
     <script>/* search uses inline handler above */</script>"""
     return page("صفحه اصلی", "home", content)
 
@@ -498,19 +641,33 @@ def create():
                 sync_and_restart_xray()
                 u = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
                 vless = build_vless(u, settings)
+                reality = build_vless(u, settings, kind="reality")
+                xhttp = build_vless(u, settings, kind="xhttp")
                 sub = sub_url_for(u, settings)
+                def _cfg_block(link, title, note=""):
+                    if not link:
+                        return ""
+                    return (f'<p class="small" style="margin-top:12px">{title}</p>'
+                            f'<div class="mono">{link}</div><br>'
+                            f'<div class="row">{copy_btn(link, "📋 کپی")}</div>'
+                            f'<p class="small">{note}</p>' if note else
+                            f'<p class="small" style="margin-top:12px">{title}</p>'
+                            f'<div class="mono">{link}</div><br>'
+                            f'<div class="row">{copy_btn(link, "📋 کپی")}</div>')
                 result = f"""
                 <div class="okmsg">✅ کاربر <b>{username}</b> ساخته شد!</div>
                 <div class="card"><h2>🦁☀️ کانفیگ کاربر — شیر و خورشید</h2>
                 <p>👤 نام کاربری: <b>{username}</b><br>📦 حجم: <b>{volume:g} گیگابایت</b><br>
                 ⏳ مدت: <b>{days} روز</b> (تا {fmt_date(u['expires_at'])})</p>
-                <p class="small">کانفیگ VLESS:</p><div class="mono">{vless}</div><br>
-                <div class="row">{copy_btn(vless, '📋 کپی کانفیگ')}{copy_btn(sub, '🔗 کپی ساب‌لینک')}</div>
-                <p class="small" style="margin-top:12px">ساب‌لینک:</p><div class="mono">{sub}</div>
-                <p class="small">داخل ساب‌لینک، به ترتیب: 👤 نام کاربری، 📦 حجم، ⏳ زمان باقی‌مانده، و بعد خود کانفیگ.</p>
+                {_cfg_block(reality, '🔒 <b>کانفیگ Reality — اول این را تست کن (برای ایران):</b>', 'دستگاه را طوری نشان می‌دهد که انگار به snapp.ir وصل است؛ DPI نمی‌تواند آن را خفه کند. اگر TCP Proxy در تنظیمات وارد نشده باشد، این کانفیگ نمایش داده نمی‌شود.')}
+                {_cfg_block(xhttp, '⚡ <b>کانفیگ XHTTP:</b>', 'روی پورت 443 و از مسیر HTTPS پنل می‌آید؛ اگر Reality وصل نشد این را تست کن.')}
+                {_cfg_block(vless, '📋 <b>کانفیگ VLESS (WebSocket):</b>', '')}
+                <p class="small" style="margin-top:12px">ساب‌لینک (همه کانفیگ‌ها داخلش هست):</p><div class="mono">{sub}</div>
+                <div class="row">{copy_btn(sub, '🔗 کپی ساب‌لینک')}</div>
+                <p class="small">داخل ساب‌لینک، به ترتیب: 👤 نام کاربری، 📦 حجم، ⏳ زمان باقی‌مانده، و بعد خود کانفیگ‌ها (WS، بعد Reality، بعد XHTTP).</p>
                 <div id="qr" class="qr"></div>
                 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-                <script>new QRCode(document.getElementById("qr"),{{text:"{vless}",width:180,height:180}});</script>
+                <script>new QRCode(document.getElementById("qr"),{{text:"{reality or vless}",width:180,height:180}});</script>
                 </div>"""
             except sqlite3.IntegrityError:
                 error = f"کاربری با نام «{username}» قبلاً ساخته شده است."
@@ -559,6 +716,16 @@ def settings_page():
             set_setting("sub_base_url", (request.form.get("sub_base_url") or "").strip())
             unit = (request.form.get("sub_volume_unit") or "GB").upper()
             set_setting("sub_volume_unit", "MB" if unit == "MB" else "GB")
+            # Reality (raw TCP via Railway TCP Proxy) — the strong transport.
+            set_setting("reality_dest", (request.form.get("reality_dest") or "snapp.ir").strip() or "snapp.ir")
+            set_setting("reality_host", (request.form.get("reality_host") or "").strip())
+            try:
+                rport = int(request.form.get("reality_port") or 0)
+                set_setting("reality_port", str(rport) if 1 <= rport <= 65535 else "")
+            except ValueError:
+                pass
+            # After saving the proxy endpoint, rebuild Xray + Reality links.
+            sync_and_restart_xray()
         if not msg:
             msg = "<div class='okmsg'>✅ تنظیمات ذخیره شد.</div>"
     s = get_all_settings()
@@ -583,6 +750,15 @@ def settings_page():
       <label>📦 واحد حجم مصرفی در ساب‌لینک</label>
       <select name="sub_volume_unit"><option value="GB" {'selected' if (s.get('sub_volume_unit') or 'GB')=='GB' else ''}>گیگابایت (GB)</option>
       <option value="MB" {'selected' if (s.get('sub_volume_unit') or 'GB')=='MB' else ''}>مگابایت (MB)</option></select>
+      <hr style="border-color:rgba(255,255,255,.15);margin:18px 0">
+      <p class="small">🔒 <b>Reality (قدرتمندترین کانفیگ — برای ایران):</b> ترافیک Reality دقیقاً مثل اتصال TLS به سایت پوششی به نظر می‌رسد و DPI نمی‌تواند آن را خفه کند. برای فعال شدن، در Railway سرویس → Settings → Networking → <b>TCP Proxy</b> را روی پورت داخلی <b>8443</b> فعال کن و آدرس و پورتی که Railway می‌دهد را اینجا وارد کن.</p>
+      <label>🌐 دامنه پوششی Reality (سایتی پرترافیک که کسی نمی‌تواند فیلترش کند)</label>
+      <input name="reality_dest" value="{s.get('reality_dest') or 'snapp.ir'}" dir="ltr" style="text-align:left" placeholder="snapp.ir">
+      <label>📡 آدرس TCP Proxy ریل‌وی (مثل xxx.proxy.rlwy.net)</label>
+      <input name="reality_host" value="{s.get('reality_host') or ''}" dir="ltr" style="text-align:left" placeholder="xxx.proxy.rlwy.net">
+      <label>🔌 پورت TCP Proxy ریل‌وی</label>
+      <input name="reality_port" type="number" value="{s.get('reality_port') or ''}" dir="ltr" style="text-align:left" placeholder="مثلاً 15140">
+      <p class="small">کلید عمومی Reality: <span style="direction:ltr;display:inline-block">{(s.get('reality_public_key') or '— هنوز ساخته نشده —')[:24]}…</span> &nbsp;|&nbsp; shortId: <span style="direction:ltr;display:inline-block">{s.get('reality_short_id') or '—'}</span></p>
       <div style="height:14px"></div><button class="btn">💾 ذخیره تنظیمات</button>
     </form>
     </div>
@@ -594,7 +770,7 @@ def settings_page():
       <div style="height:14px"></div><button class="btn">🔐 تغییر رمز</button>
     </form></div>
     <div class="card"><p class="small">نمونه ساب‌لینک: <span style="direction:ltr;display:inline-block">{base}/sub/&lt;token&gt;</span><br>
-    💡 آدرس سرور را حتماً وارد کن؛ بدون آن کانفیگ‌ها با your-server.com ساخته می‌شوند.</p></div>"""
+    💡 کانفیگ‌ها با دامنه همین پنل ساخته می‌شوند؛ برای Reality، آدرس TCP Proxy را در بخش Reality همین صفحه وارد کن.</p></div>"""
     return page("تنظیمات", "settings", content)
 
 @app.route("/user/<int:user_id>/toggle-stop", methods=["POST"])
@@ -647,6 +823,8 @@ def sub(token):
     days = remaining_days(user)
     pct = int(left / vol * 100) if vol else 0
     vless = build_vless(user, settings)
+    reality = build_vless(user, settings, kind="reality")
+    xhttp = build_vless(user, settings, kind="xhttp")
     sub_url = sub_url_for(user, settings)
     html = f"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -674,7 +852,9 @@ box-shadow:0 6px 30px rgba(0,0,0,.5);border:2px solid #fbbf24}}
 <div class="bar"><i></i></div>
 <p class="small" style="margin-top:14px">کانفیگ VLESS:</p><div class="mono">{vless}</div><br>
 <div class="row">{copy_btn(vless, '📋 کپی کانفیگ')}{copy_btn(sub_url, '🔗 کپی ساب‌لینک')}</div>
-<p class="small">این ساب‌لینک را در v2rayNG / Streisand / FoXray وارد کن — اول سه خط اطلاعات (👤 📦 ⏳) و بعد خود کانفیگ نمایش داده می‌شود.</p>
+{f'<p class="small" style="margin-top:14px">🔒 کانفیگ Reality (اول این را تست کن):</p><div class="mono">{reality}</div><br><div class="row">{copy_btn(reality, "📋 کپی Reality")}</div>' if reality else ''}
+{f'<p class="small" style="margin-top:14px">⚡ کانفیگ XHTTP:</p><div class="mono">{xhttp}</div><br><div class="row">{copy_btn(xhttp, "📋 کپی XHTTP")}</div>' if xhttp else ''}
+<p class="small">این ساب‌لینک را در v2rayNG / Streisand / FoXray وارد کن — اول سه خط اطلاعات (👤 📦 ⏳) و بعد خود کانفیگ‌ها نمایش داده می‌شود.</p>
 <div id="qr" class="qr"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>new QRCode(document.getElementById("qr"),{{text:"{vless}",width:180,height:180}});</script>
