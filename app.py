@@ -76,6 +76,7 @@ DEFAULT_SETTINGS = {
     "network": "ws",
     "security": "tls",
     "sub_base_url": "",
+    "sub_volume_unit": "GB",
     "admin_password_hash": _sha("admin"),
 }
 
@@ -111,6 +112,10 @@ def init_db():
     )""")
     for k, v in DEFAULT_SETTINGS.items():
         db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+    # migration: stop/start flag for users (added after v1)
+    cols = [r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()]
+    if "stopped" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0")
     db.commit()
     db.close()
 
@@ -143,7 +148,20 @@ def remaining_days(user):
     return max(0, math.ceil(delta.total_seconds() / 86400)) if delta.total_seconds() > 0 else 0
 
 def is_active(user):
+    try:
+        if user["stopped"]:
+            return False
+    except Exception:
+        pass
     return bool(user["active"]) and remaining_days(user) > 0
+
+def format_volume_text(user, settings):
+    """📦 line for the sub link, in GB or MB per the Settings choice."""
+    vol = float(user["volume_gb"])
+    left = max(0.0, vol - float(user["used_gb"]))
+    if (settings.get("sub_volume_unit") or "GB").upper() == "MB":
+        return f"📦 حجم: {vol * 1024:g} مگابایت | باقی‌مانده: {left * 1024:g} مگابایت"
+    return f"📦 حجم: {vol:g} گیگابایت | باقی‌مانده: {left:g} گیگابایت"
 
 def fmt_date(s):
     return parse_dt(s).strftime("%Y-%m-%d")
@@ -178,7 +196,7 @@ def build_sub_lines(user, settings):
     days = remaining_days(user)
     lines = [
         build_vless(user, settings, remark=f"👤 نام کاربری: {user['username']}"),
-        build_vless(user, settings, remark=f"📦 حجم: {vol:g} گیگابایت | باقی‌مانده: {left:g} گیگابایت"),
+        build_vless(user, settings, remark=format_volume_text(user, settings)),
         build_vless(user, settings, remark=f"⏳ زمان باقی‌مانده: {days} روز"),
         build_vless(user, settings),
     ]
@@ -205,6 +223,10 @@ def sync_xray_config():
         clients.append({"id": u["uuid"], "email": u["username"], "level": 0})
     cfg = {
         "log": {"loglevel": "warning"},
+        # Force IPv4 DNS: some networks answer AAAA records first but have no
+        # IPv6 egress, so connections hang forever (ping works, data never
+        # flows — YouTube/Telegram never load). UseIPv4 fixes that.
+        "dns": {"servers": ["8.8.8.8", "1.1.1.1"], "queryStrategy": "UseIPv4"},
         "inbounds": [{
             "port": XRAY_PORT,
             "protocol": "vless",
@@ -213,9 +235,12 @@ def sync_xray_config():
                 "network": "ws",
                 "wsSettings": {"path": f"/{WS_PATH}"},
             },
-            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
+            # Sniffing OFF: it misroutes non-TLS traffic (Telegram MTProto)
+            # and stalls connections; the original destination is correct.
+            "sniffing": {"enabled": False},
         }],
-        "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+        "outbounds": [{"protocol": "freedom", "tag": "direct",
+                       "domainStrategy": "UseIPv4"}],
     }
     try:
         os.makedirs(os.path.dirname(XRAY_CONFIG_PATH) or ".", exist_ok=True)
@@ -402,15 +427,28 @@ def home():
     rows = ""
     for u in users:
         days = remaining_days(u)
-        st = "<span class='badge ok'>فعال ✅</span>" if is_active(u) else "<span class='badge off'>منقضی ⛔</span>"
+        try:
+            stopped = bool(u["stopped"])
+        except Exception:
+            stopped = False
+        if stopped:
+            st = "<span class='badge off'>متوقف ⏸️</span>"
+        elif is_active(u):
+            st = "<span class='badge ok'>فعال ✅</span>"
+        else:
+            st = "<span class='badge off'>منقضی ⛔</span>"
         vless = build_vless(u, settings)
         sub = sub_url_for(u, settings)
+        stop_label = "▶️ شروع" if stopped else "⏸️ توقف"
         rows += f"""<tr><td><b>{u['username']}</b><br><span class="small">{st}</span></td>
         <td>{float(u['volume_gb']):g} GB</td><td>{float(u['used_gb']):g} GB</td><td>{days} روز<br><span class="small">تا {fmt_date(u['expires_at'])}</span></td>
         <td><div class="row">{copy_btn(vless, '📋 کانفیگ')}{copy_btn(sub, '🔗 ساب')}</div>
         <div style="height:6px"></div>
+        <div class="row">
+        <form method="post" action="/user/{u['id']}/toggle-stop">
+        <button class="btn ghost" style="padding:6px 14px;font-size:13px">{stop_label}</button></form>
         <form method="post" action="/user/{u['id']}/delete" onsubmit="return confirm('کاربر {u['username']} حذف شود؟')">
-        <button class="btn ghost" style="padding:6px 14px;font-size:13px">🗑️ حذف</button></form></td></tr>"""
+        <button class="btn ghost" style="padding:6px 14px;font-size:13px">🗑️ حذف</button></form></div></td></tr>"""
     content = f"""
     <div class="stats">
       <div class="stat"><b>{total}</b>کل کاربران 👥</div>
@@ -519,6 +557,8 @@ def settings_page():
             set_setting("network", request.form.get("network") or "ws")
             set_setting("security", request.form.get("security") or "tls")
             set_setting("sub_base_url", (request.form.get("sub_base_url") or "").strip())
+            unit = (request.form.get("sub_volume_unit") or "GB").upper()
+            set_setting("sub_volume_unit", "MB" if unit == "MB" else "GB")
         if not msg:
             msg = "<div class='okmsg'>✅ تنظیمات ذخیره شد.</div>"
     s = get_all_settings()
@@ -540,6 +580,9 @@ def settings_page():
       <option value="none" {'selected' if s['security']=='none' else ''}>none</option></select>
       <label>🔗 آدرس پایه ساب‌لینک (خالی = همین دامنه پنل)</label>
       <input name="sub_base_url" value="{s['sub_base_url']}" dir="ltr" style="text-align:left" placeholder="https://your-panel.up.railway.app">
+      <label>📦 واحد حجم مصرفی در ساب‌لینک</label>
+      <select name="sub_volume_unit"><option value="GB" {'selected' if (s.get('sub_volume_unit') or 'GB')=='GB' else ''}>گیگابایت (GB)</option>
+      <option value="MB" {'selected' if (s.get('sub_volume_unit') or 'GB')=='MB' else ''}>مگابایت (MB)</option></select>
       <div style="height:14px"></div><button class="btn">💾 ذخیره تنظیمات</button>
     </form>
     </div>
@@ -553,6 +596,24 @@ def settings_page():
     <div class="card"><p class="small">نمونه ساب‌لینک: <span style="direction:ltr;display:inline-block">{base}/sub/&lt;token&gt;</span><br>
     💡 آدرس سرور را حتماً وارد کن؛ بدون آن کانفیگ‌ها با your-server.com ساخته می‌شوند.</p></div>"""
     return page("تنظیمات", "settings", content)
+
+@app.route("/user/<int:user_id>/toggle-stop", methods=["POST"])
+def toggle_stop(user_id):
+    chk = require_login()
+    if chk: return chk
+    db = get_db()
+    u = db.execute("SELECT stopped FROM users WHERE id=?", (user_id,)).fetchone()
+    if u is not None:
+        try:
+            cur = int(u["stopped"])
+        except Exception:
+            cur = 0
+        db.execute("UPDATE users SET stopped=? WHERE id=?", (0 if cur else 1, user_id))
+        db.commit()
+        # Stopped users leave Xray's client list (config stops working);
+        # started users come back (config works again).
+        sync_and_restart_xray()
+    return redirect("/")
 
 @app.route("/user/<int:user_id>/delete", methods=["POST"])
 def delete_user(user_id):
@@ -607,7 +668,7 @@ box-shadow:0 6px 30px rgba(0,0,0,.5);border:2px solid #fbbf24}}
 <p style="text-align:center;color:#fde68a">🇮🇷 پرچم شیر و خورشید 🇮🇷</p>
 <div class="card"><h2>🦁☀️ اشتراک شما</h2><div class="info">
 👤 <b>نام کاربری:</b> {user['username']}<br>
-📦 <b>حجم:</b> {vol:g} گیگابایت &nbsp;|&nbsp; باقی‌مانده: {left:g} گیگابایت<br>
+{format_volume_text(user, settings)}<br>
 ⏳ <b>زمان باقی‌مانده:</b> {days} روز (تا {fmt_date(user['expires_at'])})<br>
 📊 <b>حجم باقی‌مانده:</b> {pct}٪</div>
 <div class="bar"><i></i></div>

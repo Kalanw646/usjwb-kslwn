@@ -19,6 +19,12 @@ http {
       proxy_set_header Upgrade $http_upgrade;
       proxy_set_header Connection "upgrade";
       proxy_set_header Host $host;
+      # Never buffer a live WebSocket stream: buffering stalls YouTube /
+      # Telegram data (handshake/ping works, real data never arrives).
+      proxy_buffering off;
+      proxy_request_buffering off;
+      tcp_nodelay on;
+      proxy_socket_keepalive on;
       proxy_read_timeout 86400s;
       proxy_send_timeout 86400s;
     }
