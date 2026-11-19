@@ -67,6 +67,12 @@ DB_PATH = os.path.join(DATA_DIR, "nexuz.db")
 # default "admin", changeable from the Settings page.
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
+# KataBump mode (set by main.py, the KataBump entry point): no Xray binary,
+# no nginx, no TCP Proxy on KataBump — only the WS relay runs. The panel
+# keeps its pages and DB exactly the same; it just skips the Xray config
+# rewrite/restart and only hands out WS configs (XHTTP/Reality need Xray).
+KATABUMP = os.environ.get("KATABUMP") == "1"
+
 def _sha(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
@@ -202,6 +208,8 @@ def build_vless(user, settings, server=None, remark=None, kind="ws"):
     kind="xhttp": VLESS+XHTTP+TLS on 443 to the panel domain.
     kind="reality": VLESS+Reality over raw TCP to the Railway TCP Proxy
     endpoint; None when not configured yet."""
+    if KATABUMP and kind in ("xhttp", "reality"):
+        return None  # no Xray on KataBump — WS only
     if kind == "reality":
         host = (settings.get("reality_host") or "").strip()
         port = (settings.get("reality_port") or "").strip()
@@ -316,6 +324,8 @@ def sync_xray_config():
     - Reality on 8443 (raw TCP, exposed via Railway TCP Proxy) — the strong
       one for Iran: the handshake looks exactly like TLS to the cover domain,
       so DPI can't starve it the way it starves the WS tunnel."""
+    if KATABUMP:
+        return  # no Xray on KataBump; the WS relay reads the DB per connection
     import json
     ensure_reality_keys()
     try:
@@ -405,6 +415,8 @@ def restart_xray():
         pass
 
 def sync_and_restart_xray():
+    if KATABUMP:
+        return  # nothing to restart: the relay reads the DB live
     sync_xray_config()
     restart_xray()
 
@@ -563,14 +575,19 @@ def home():
     active_n = sum(1 for u in users if is_active(u))
     total_vol = sum(float(u["volume_gb"]) for u in users)
     used_vol = sum(float(u["used_gb"]) for u in users)
-    import subprocess as _sp
-    try:
-        _r = _sp.run(["pgrep", "-f", "xray run"], capture_output=True, timeout=3)
-        _r2 = _sp.run(["pgrep", "-f", "ws_relay.py"], capture_output=True, timeout=3)
-        xray_on = _r.returncode == 0 and _r2.returncode == 0
-    except Exception:
-        xray_on = False
-    xray_badge = "🟢 هسته V2Ray فعال است" if xray_on else "🔴 هسته V2Ray خاموش است"
+    if KATABUMP:
+        # The WS relay runs inside the panel process itself (main.py), so
+        # if this page renders, the core is up.
+        xray_badge = "🟢 هسته WS فعال است"
+    else:
+        import subprocess as _sp
+        try:
+            _r = _sp.run(["pgrep", "-f", "xray run"], capture_output=True, timeout=3)
+            _r2 = _sp.run(["pgrep", "-f", "ws_relay.py"], capture_output=True, timeout=3)
+            xray_on = _r.returncode == 0 and _r2.returncode == 0
+        except Exception:
+            xray_on = False
+        xray_badge = "🟢 هسته V2Ray فعال است" if xray_on else "🔴 هسته V2Ray خاموش است"
     rows = ""
     for u in users:
         days = remaining_days(u)
@@ -610,12 +627,12 @@ def home():
       <div class="stat"><b>{total_vol:g} GB</b>حجم کل 📦</div>
       <div class="stat"><b>{used_vol:g} GB</b>حجم مصرفی 📊</div>
     </div>
-    <p class="small" style="text-align:center">{xray_badge} &nbsp;|&nbsp; سرور کانفیگ: دامنه همین پنل (هسته V2Ray روی همین سرور نصب است)</p>
+    <p class="small" style="text-align:center">{xray_badge} &nbsp;|&nbsp; سرور کانفیگ: دامنه همین پنل {'(هسته WS روی همین سرور است)' if KATABUMP else '(هسته V2Ray روی همین سرور نصب است)'}</p>
     <div class="card"><h2>👥 کاربران</h2>
     <input id="q" placeholder="🔍 جستجوی کاربر..." oninput="document.querySelectorAll('tbody tr').forEach(r=>r.style.display=r.textContent.includes(this.value)?'':'none')">
     <div style="overflow-x:auto"><table><thead><tr><th>کاربر</th><th>حجم</th><th>مصرف‌شده</th><th>زمان باقی‌مانده</th><th>اقدام</th></tr></thead>
     <tbody>{rows or '<tr><td colspan="5">هنوز کاربری ساخته نشده — از صفحه «ایجاد کاربر» شروع کن ➕</td></tr>'}</tbody></table></div>
-    <p class="small">💡 کانفیگ اصلی (📋 کانفیگ) همان مدل WhitePanel است — VLESS روی WebSocket با مسیر /ws/شناسه کاربر؛ اگر Reality را می‌خواهی، در «تنظیمات» آدرس TCP Proxy ریل‌وی را وارد کن.</p></div>
+    <p class="small">💡 کانفیگ اصلی (📋 کانفیگ) همان مدل WhitePanel است — VLESS روی WebSocket با مسیر /ws/شناسه کاربر{'؛ روی KataBump فقط همین کانفیگ کار می‌کند.' if KATABUMP else '؛ اگر Reality را می‌خواهی، در «تنظیمات» آدرس TCP Proxy ریل‌وی را وارد کن.'}</p></div>
     <script>/* search uses inline handler above */</script>"""
     return page("صفحه اصلی", "home", content)
 
@@ -675,7 +692,7 @@ def create():
                 {_cfg_block(reality, '🔒 <b>کانفیگ Reality:</b>', 'دستگاه را طوری نشان می‌دهد که انگار به snapp.ir وصل است. اگر TCP Proxy در تنظیمات وارد نشده باشد، این کانفیگ نمایش داده نمی‌شود.')}
                 <p class="small" style="margin-top:12px">ساب‌لینک (همه کانفیگ‌ها داخلش هست):</p><div class="mono">{sub}</div>
                 <div class="row">{copy_btn(sub, '🔗 کپی ساب‌لینک')}</div>
-                <p class="small">داخل ساب‌لینک، به ترتیب: 👤 نام کاربری، 📦 حجم، ⏳ زمان باقی‌مانده، و بعد خود کانفیگ‌ها (WS، بعد XHTTP، بعد Reality).</p>
+                <p class="small">داخل ساب‌لینک، به ترتیب: 👤 نام کاربری، 📦 حجم، ⏳ زمان باقی‌مانده، و بعد خود کانفیگ‌ها{' (فقط WS)' if KATABUMP else ' (WS، بعد XHTTP، بعد Reality)'}.</p>
                 <div id="qr" class="qr"></div>
                 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
                 <script>new QRCode(document.getElementById("qr"),{{text:"{vless}",width:180,height:180}});</script>
