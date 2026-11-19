@@ -1,12 +1,20 @@
 #!/bin/bash
 set -e
-# nginx listens on Railway's $PORT; Xray on 10086, Flask panel on 5000.
+# nginx listens on Railway's $PORT; WS relay on 10089, Xray on 10086,
+# Flask panel on 5000.
 sed "s/__PORT__/${PORT:-8080}/g" /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
 nginx -t -c /etc/nginx/nginx.conf
 # Build the first Xray config from the panel DB (empty clients list is fine).
 python3 -c "import app; app.sync_xray_config()" || true
 CFG=/data/xray-config.json
 [ -f "$CFG" ] || CFG=./xray-config.json
+# WS relay (WhitePanel-style VLESS-over-WebSocket, the transport that works
+# in Iran): restarts automatically if it ever exits.
+( while true; do
+    python3 ws_relay.py || true
+    echo "ws-relay exited, restarting in 2s"
+    sleep 2
+  done ) &
 # Xray loop: restarts automatically when the panel kills it after a
 # user create/delete (the panel rewrites the config first).
 ( while true; do

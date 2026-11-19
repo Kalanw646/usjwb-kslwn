@@ -44,11 +44,14 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 # Xray core runs in the same Railway container (see Dockerfile/start.sh):
-# nginx on $PORT proxies WS /nexuz to Xray (127.0.0.1:10086), XHTTP /xhttp
-# to Xray (127.0.0.1:10087), and everything else to this Flask panel
-# (127.0.0.1:5000). Railway terminates TLS, so Xray uses security=none
-# internally for those and clients use tls on port 443. Reality runs on
-# raw TCP 8443, exposed via Railway TCP Proxy (no TLS termination there).
+# nginx on $PORT proxies /ws/<uuid> to the Python WS relay ws_relay.py
+# (127.0.0.1:10089) — the WhitePanel-style VLESS-over-WebSocket transport
+# that actually works in Iran — XHTTP /xhttp to Xray (127.0.0.1:10087),
+# the legacy WS /nexuz to Xray (127.0.0.1:10086), and everything else to
+# this Flask panel (127.0.0.1:5000). Railway terminates TLS, so the relay
+# and Xray use security=none internally and clients use tls on port 443.
+# Reality runs on raw TCP 8443, exposed via Railway TCP Proxy.
+WS_RELAY_PORT = 10089  # WhitePanel-style VLESS-over-WS relay (primary transport)
 XRAY_PORT = 10086  # VLESS+WS inbound (behind nginx, plain HTTP after the edge)
 XHTTP_PORT = 10087  # VLESS+XHTTP inbound (behind nginx, plain HTTP after the edge)
 REALITY_PORT = 8443  # VLESS+Reality inbound (raw TCP, via Railway TCP Proxy)
@@ -191,10 +194,14 @@ def default_server():
 
 def build_vless(user, settings, server=None, remark=None, kind="ws"):
     """Real VLESS URI for a user.
-    kind="ws": VLESS+WS+TLS on 443 to the panel domain (fallback).
+    kind="ws": PRIMARY — WhitePanel-style VLESS+WS+TLS on 443 to the panel
+    domain, path /ws/<uuid>, alpn http/1.1. The server side is ws_relay.py
+    (the panel's own VLESS-over-WebSocket relay, a port of WhitePanel's
+    Go relay), not Xray's WS transport — that is the transport Ali verified
+    works in Iran on the same Railway infra. WS rides on HTTP/1.1 only.
     kind="xhttp": VLESS+XHTTP+TLS on 443 to the panel domain.
     kind="reality": VLESS+Reality over raw TCP to the Railway TCP Proxy
-    endpoint (the strong one for Iran); None when not configured yet."""
+    endpoint; None when not configured yet."""
     if kind == "reality":
         host = (settings.get("reality_host") or "").strip()
         port = (settings.get("reality_port") or "").strip()
@@ -215,9 +222,12 @@ def build_vless(user, settings, server=None, remark=None, kind="ws"):
         params = (f"encryption=none&security=tls&sni={quote(sni)}&fp=chrome"
                   f"&type=xhttp&mode=packet-up&path=%2F{XHTTP_PATH}&host={quote(server)}")
     else:
-        # Railway terminates TLS on 443; Xray behind nginx uses ws, no TLS.
+        # WhitePanel-style, byte-for-byte the format Ali verified live:
+        # encryption=none&security=tls&sni=<domain>&fp=chrome&alpn=http/1.1
+        # &type=ws&host=<domain>&path=/ws/<uuid> — served by ws_relay.py.
         params = (f"encryption=none&security=tls&sni={quote(sni)}&fp=chrome"
-                  f"&type=ws&path=%2F{WS_PATH}&host={quote(server)}")
+                  f"&alpn=http%2F1.1&type=ws&host={quote(server)}"
+                  f"&path=%2Fws%2F{user['uuid']}")
     return (f"vless://{user['uuid']}@{server}:{port}?{params}"
             f"#{quote(remark if remark is not None else user['username'])}")
 
@@ -235,16 +245,16 @@ def build_sub_lines(user, settings):
         build_vless(user, settings, remark=f"⏳ زمان باقی‌مانده: {days} روز"),
         build_vless(user, settings),
     ]
-    # Reality first-class: the strong transport for Iran (DPI can't tell it
-    # from a real TLS handshake to the cover domain). XHTTP second.
-    reality = build_vless(user, settings, kind="reality",
-                          remark=f"🔒 Reality — {user['username']}")
-    if reality:
-        lines.append(reality)
+    # WS first (WhitePanel-style relay — the transport that works in Iran),
+    # then XHTTP, then Reality (both were reported cut in Iran).
     xhttp = build_vless(user, settings, kind="xhttp",
                         remark=f"⚡ XHTTP — {user['username']}")
     if xhttp:
         lines.append(xhttp)
+    reality = build_vless(user, settings, kind="reality",
+                          remark=f"🔒 Reality — {user['username']}")
+    if reality:
+        lines.append(reality)
     return lines
 
 def _read_settings_direct():
@@ -556,7 +566,8 @@ def home():
     import subprocess as _sp
     try:
         _r = _sp.run(["pgrep", "-f", "xray run"], capture_output=True, timeout=3)
-        xray_on = _r.returncode == 0
+        _r2 = _sp.run(["pgrep", "-f", "ws_relay.py"], capture_output=True, timeout=3)
+        xray_on = _r.returncode == 0 and _r2.returncode == 0
     except Exception:
         xray_on = False
     xray_badge = "🟢 هسته V2Ray فعال است" if xray_on else "🔴 هسته V2Ray خاموش است"
@@ -604,7 +615,7 @@ def home():
     <input id="q" placeholder="🔍 جستجوی کاربر..." oninput="document.querySelectorAll('tbody tr').forEach(r=>r.style.display=r.textContent.includes(this.value)?'':'none')">
     <div style="overflow-x:auto"><table><thead><tr><th>کاربر</th><th>حجم</th><th>مصرف‌شده</th><th>زمان باقی‌مانده</th><th>اقدام</th></tr></thead>
     <tbody>{rows or '<tr><td colspan="5">هنوز کاربری ساخته نشده — از صفحه «ایجاد کاربر» شروع کن ➕</td></tr>'}</tbody></table></div>
-    <p class="small">💡 کانفیگ‌ها با دامنه همین پنل ساخته می‌شوند؛ اگر Reality را می‌خواهی، در «تنظیمات» آدرس TCP Proxy ریل‌وی را وارد کن.</p></div>
+    <p class="small">💡 کانفیگ اصلی (📋 کانفیگ) همان مدل WhitePanel است — VLESS روی WebSocket با مسیر /ws/شناسه کاربر؛ اگر Reality را می‌خواهی، در «تنظیمات» آدرس TCP Proxy ریل‌وی را وارد کن.</p></div>
     <script>/* search uses inline handler above */</script>"""
     return page("صفحه اصلی", "home", content)
 
@@ -659,15 +670,15 @@ def create():
                 <div class="card"><h2>🦁☀️ کانفیگ کاربر — شیر و خورشید</h2>
                 <p>👤 نام کاربری: <b>{username}</b><br>📦 حجم: <b>{volume:g} گیگابایت</b><br>
                 ⏳ مدت: <b>{days} روز</b> (تا {fmt_date(u['expires_at'])})</p>
-                {_cfg_block(reality, '🔒 <b>کانفیگ Reality — اول این را تست کن (برای ایران):</b>', 'دستگاه را طوری نشان می‌دهد که انگار به snapp.ir وصل است؛ DPI نمی‌تواند آن را خفه کند. اگر TCP Proxy در تنظیمات وارد نشده باشد، این کانفیگ نمایش داده نمی‌شود.')}
-                {_cfg_block(xhttp, '⚡ <b>کانفیگ XHTTP:</b>', 'روی پورت 443 و از مسیر HTTPS پنل می‌آید؛ اگر Reality وصل نشد این را تست کن.')}
-                {_cfg_block(vless, '📋 <b>کانفیگ VLESS (WebSocket):</b>', '')}
+                {_cfg_block(vless, '📋 <b>کانفیگ VLESS (WebSocket) — اول این را تست کن:</b>', 'همان مدل WhitePanel است: مسیر /ws/شناسه کاربر، روی دامنه همین پنل.')}
+                {_cfg_block(xhttp, '⚡ <b>کانفیگ XHTTP:</b>', 'روی پورت 443 و از مسیر HTTPS پنل می‌آید؛ اگر WS وصل نشد این را تست کن.')}
+                {_cfg_block(reality, '🔒 <b>کانفیگ Reality:</b>', 'دستگاه را طوری نشان می‌دهد که انگار به snapp.ir وصل است. اگر TCP Proxy در تنظیمات وارد نشده باشد، این کانفیگ نمایش داده نمی‌شود.')}
                 <p class="small" style="margin-top:12px">ساب‌لینک (همه کانفیگ‌ها داخلش هست):</p><div class="mono">{sub}</div>
                 <div class="row">{copy_btn(sub, '🔗 کپی ساب‌لینک')}</div>
-                <p class="small">داخل ساب‌لینک، به ترتیب: 👤 نام کاربری، 📦 حجم، ⏳ زمان باقی‌مانده، و بعد خود کانفیگ‌ها (WS، بعد Reality، بعد XHTTP).</p>
+                <p class="small">داخل ساب‌لینک، به ترتیب: 👤 نام کاربری، 📦 حجم، ⏳ زمان باقی‌مانده، و بعد خود کانفیگ‌ها (WS، بعد XHTTP، بعد Reality).</p>
                 <div id="qr" class="qr"></div>
                 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-                <script>new QRCode(document.getElementById("qr"),{{text:"{reality or vless}",width:180,height:180}});</script>
+                <script>new QRCode(document.getElementById("qr"),{{text:"{vless}",width:180,height:180}});</script>
                 </div>"""
             except sqlite3.IntegrityError:
                 error = f"کاربری با نام «{username}» قبلاً ساخته شده است."
