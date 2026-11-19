@@ -395,7 +395,7 @@ def create():
     <form method="post">
       <label>👤 نام کاربری</label><input name="username" required minlength="2" placeholder="مثلاً ali123">
       <label>⏳ مدت زمان (روز)</label><input name="days" type="number" value="30" min="1" max="3650" required>
-      <label>📦 حجم (گیگابایت)</label><input name="volume_gb" type="number" step="0.5" value="10" min="0.1" required>
+      <label>📦 حجم (گیگابایت)</label><input name="volume_gb" type="number" step="any" value="10" min="0.1" required>
       <div style="height:14px"></div><button class="btn">🦁 ساخت کاربر + کانفیگ VLESS</button>
     </form></div>
     {result}"""
